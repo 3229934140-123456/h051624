@@ -338,13 +338,16 @@ class NetworkAnalyzer:
         
         if src_port or dst_port:
             is_tcp = parsed.tcp is not None
-            result = self._app_identifier.identify(
-                payload,
-                src_port,
-                dst_port,
-                is_tcp
-            )
-            parsed.app_protocol = result.protocol.value
+            try:
+                result = self._app_identifier.identify(
+                    payload,
+                    src_port,
+                    dst_port,
+                    is_tcp
+                )
+                parsed.app_protocol = result.protocol.value
+            except Exception:
+                parsed.app_protocol = "unknown"
             parsed.app_data = payload
     
     def _identify_app_protocol(
@@ -370,18 +373,21 @@ class NetworkAnalyzer:
         else:
             src_port, dst_port = server_port, client_port
         
-        result = self._app_identifier.identify(
-            new_data,
-            src_port,
-            dst_port,
-            True,
-            stream.five_tuple,
-        )
-        
-        if result.confidence > 0.6:
-            stream.app_protocol = result.protocol.value
-            stream.app_protocol_method = result.method.value
-            stream.app_protocol_confidence = result.confidence
+        try:
+            result = self._app_identifier.identify(
+                new_data,
+                src_port,
+                dst_port,
+                True,
+                stream.five_tuple,
+            )
+            
+            if result.confidence > 0.6:
+                stream.app_protocol = result.protocol.value
+                stream.app_protocol_method = result.method.value
+                stream.app_protocol_confidence = result.confidence
+        except Exception:
+            pass
     
     def _compute_five_tuple(self, parsed: ParsedPacket):
         """计算五元组"""

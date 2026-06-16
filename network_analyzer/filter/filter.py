@@ -161,6 +161,8 @@ class SimpleFilter(FilterExpression):
             return ctx.ethernet.src_mac
         if field == "ether.dst" and ctx.ethernet:
             return ctx.ethernet.dst_mac
+        if field == "ether.host" and ctx.ethernet:
+            return [ctx.ethernet.src_mac, ctx.ethernet.dst_mac]
         if field == "ether.type" and ctx.ethernet:
             return ctx.ethernet.ethertype
         
@@ -170,6 +172,8 @@ class SimpleFilter(FilterExpression):
             return ctx.ip.header.src_ip
         if field == "ip.dst" and ctx.ip:
             return ctx.ip.header.dst_ip
+        if field == "ip.host" and ctx.ip:
+            return [ctx.ip.header.src_ip, ctx.ip.header.dst_ip]
         if field == "ip.proto" and ctx.ip:
             return ctx.ip.header.protocol
         if field == "ip.ttl" and ctx.ip:
@@ -353,6 +357,31 @@ class BooleanFilter(FilterExpression):
         if field == "smtp":
             return ctx.app_protocol == "smtp"
         
+        if field.startswith("tcp.flags.") and ctx.tcp:
+            flag_name = field.split(".")[-1].upper()
+            flag_map = {
+                "SYN": ctx.tcp.syn,
+                "ACK": ctx.tcp.ack_flag,
+                "FIN": ctx.tcp.fin,
+                "RST": ctx.tcp.rst,
+                "PSH": ctx.tcp.psh,
+                "URG": ctx.tcp.urg,
+            }
+            return flag_map.get(flag_name, False)
+        
+        if field.startswith("ip.flags.") and ctx.ip:
+            flag_name = field.split(".")[-1].lower()
+            if flag_name == "df":
+                return ctx.ip.header.df_flag
+            if flag_name == "mf":
+                return ctx.ip.header.mf_flag
+            return False
+        
+        if field == "tcp.flags" and ctx.tcp:
+            return True
+        if field == "ip.flags" and ctx.ip:
+            return True
+        
         return False
 
 
@@ -435,11 +464,16 @@ class FilterParser:
             
             if s[i].isdigit():
                 j = i
-                while j < len(s) and (s[j].isdigit() or s[j] == "."):
+                while j < len(s) and (s[j].isdigit() or s[j] in ".:"):
                     j += 1
                 num_str = s[i:j]
                 
-                if num_str.count(".") == 3:
+                if re.match(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$", num_str):
+                    self.tokens.append(FilterToken(type=FilterTokenType.MAC, value=num_str.lower(), position=i))
+                    i = j
+                    continue
+                
+                if num_str.count(".") == 3 and ":" not in num_str:
                     try:
                         ipaddress.IPv4Address(num_str)
                         self.tokens.append(FilterToken(type=FilterTokenType.IP, value=num_str, position=i))
@@ -448,17 +482,20 @@ class FilterParser:
                     except ValueError:
                         pass
                 
-                try:
-                    val = int(num_str) if "." not in num_str else float(num_str)
-                    self.tokens.append(FilterToken(type=FilterTokenType.NUMBER, value=val, position=i))
-                except ValueError:
+                if ":" not in num_str:
+                    try:
+                        val = int(num_str) if "." not in num_str else float(num_str)
+                        self.tokens.append(FilterToken(type=FilterTokenType.NUMBER, value=val, position=i))
+                    except ValueError:
+                        self.tokens.append(FilterToken(type=FilterTokenType.IDENTIFIER, value=num_str, position=i))
+                else:
                     self.tokens.append(FilterToken(type=FilterTokenType.IDENTIFIER, value=num_str, position=i))
                 i = j
                 continue
             
             if s[i].isalpha() or s[i] == "_":
                 j = i
-                while j < len(s) and (s[j].isalnum() or s[j] in "._-"):
+                while j < len(s) and (s[j].isalnum() or s[j] in "._-:"):
                     j += 1
                 ident = s[i:j]
                 
@@ -646,7 +683,7 @@ class FilterParser:
         if first in {"ether", "eth"}:
             if len(parts) == 2 and parts[1] in {"src", "dst", "host", "type"}:
                 if parts[1] == "host":
-                    return "ether"
+                    return "ether.host"
                 return f"ether.{parts[1]}"
             if len(parts) == 2 and self._is_flag_name(parts[1]):
                 return f"ether.{parts[1]}"
@@ -655,7 +692,7 @@ class FilterParser:
         if first == "ip":
             if len(parts) == 2 and parts[1] in {"src", "dst", "host", "proto", "protocol", "ttl", "id", "len", "length"}:
                 if parts[1] == "host":
-                    return "ip"
+                    return "ip.host"
                 if parts[1] in {"proto", "protocol"}:
                     return "ip.proto"
                 if parts[1] in {"len", "length"}:
@@ -674,6 +711,11 @@ class FilterParser:
                 if parts[1] in {"sport", "srcport"}:
                     return f"{first}.srcport"
                 if parts[1] in {"dport", "dstport"}:
+                    return f"{first}.dstport"
+            if len(parts) == 3 and parts[1] in {"src", "dst"} and parts[2] == "port":
+                if parts[1] == "src":
+                    return f"{first}.srcport"
+                if parts[1] == "dst":
                     return f"{first}.dstport"
             if len(parts) == 2 and parts[1] == "src":
                 return f"{first}.srcport"
@@ -704,7 +746,7 @@ class FilterParser:
             return "dstip"
         
         if first == "host":
-            return "ip"
+            return "ip.host"
         
         if first == "port":
             return "port"
@@ -734,8 +776,8 @@ class FilterParser:
         shortcuts = {
             "src": "srcip",
             "dst": "dstip",
-            "host": "ip",
-            "net": "ip",
+            "host": "ip.host",
+            "net": "ip.host",
             "port": "port",
             "srcport": "srcport",
             "dstport": "dstport",
@@ -744,15 +786,16 @@ class FilterParser:
             
             "ether.src": "ether.src",
             "ether.dst": "ether.dst",
-            "ether.host": "ether",
+            "ether.host": "ether.host",
             "ether.type": "ether.type",
             "eth.src": "ether.src",
             "eth.dst": "ether.dst",
             "eth.type": "ether.type",
+            "eth.host": "ether.host",
             
             "ip.src": "ip.src",
             "ip.dst": "ip.dst",
-            "ip.host": "ip",
+            "ip.host": "ip.host",
             "ip.proto": "ip.proto",
             "ip.protocol": "ip.proto",
             "ip.ttl": "ip.ttl",

@@ -525,6 +525,118 @@ class TestFilter(unittest.TestCase):
         f = PacketFilter("udp")
         ctx = self._make_http_ctx()
         self.assertFalse(f.match(ctx))
+    
+    def test_tcp_flags_syn_match(self):
+        f = PacketFilter("tcp flags syn")
+        ctx = FilterContext()
+        ctx.ip = parse_ipv4(build_ipv4("192.168.1.1", "10.0.0.1", IP_PROTO_TCP,
+            build_tcp(12345, 80, seq=1000, flags=TCP_FLAG_SYN,
+                     src_ip="192.168.1.1", dst_ip="10.0.0.1"),
+        ))
+        ctx.tcp = parse_tcp(ctx.ip.payload, "192.168.1.1", "10.0.0.1")
+        self.assertTrue(f.match(ctx))
+    
+    def test_tcp_flags_syn_no_match_ack(self):
+        f = PacketFilter("tcp flags syn")
+        ctx = self._make_http_ctx()
+        self.assertFalse(f.match(ctx))
+    
+    def test_tcp_flags_ack_match(self):
+        f = PacketFilter("tcp flags ack")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_tcp_flags_fin_no_match(self):
+        f = PacketFilter("tcp flags fin")
+        ctx = self._make_http_ctx()
+        self.assertFalse(f.match(ctx))
+    
+    def test_tcp_src_port(self):
+        f = PacketFilter("tcp src port 12345")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_tcp_src_port_no_match(self):
+        f = PacketFilter("tcp src port 80")
+        ctx = self._make_http_ctx()
+        self.assertFalse(f.match(ctx))
+    
+    def test_tcp_dst_port(self):
+        f = PacketFilter("tcp dst port 80")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_tcp_dst_port_no_match(self):
+        f = PacketFilter("tcp dst port 12345")
+        ctx = self._make_http_ctx()
+        self.assertFalse(f.match(ctx))
+    
+    def test_udp_src_port(self):
+        f = PacketFilter("udp src port 123")
+        ctx = FilterContext()
+        ctx.ip = parse_ipv4(build_ipv4("192.168.1.1", "10.0.0.1", IP_PROTO_UDP,
+            build_udp(123, 456, b"test",
+                     src_ip="192.168.1.1", dst_ip="10.0.0.1"),
+        ))
+        ctx.udp = parse_udp(ctx.ip.payload, "192.168.1.1", "10.0.0.1")
+        self.assertTrue(f.match(ctx))
+    
+    def test_udp_dst_port(self):
+        f = PacketFilter("udp dst port 161")
+        ctx = FilterContext()
+        ctx.ip = parse_ipv4(build_ipv4("192.168.1.1", "10.0.0.1", IP_PROTO_UDP,
+            build_udp(12345, 161, b"test",
+                     src_ip="192.168.1.1", dst_ip="10.0.0.1"),
+        ))
+        ctx.udp = parse_udp(ctx.ip.payload, "192.168.1.1", "10.0.0.1")
+        self.assertTrue(f.match(ctx))
+    
+    def test_ip_host_match_src(self):
+        f = PacketFilter("ip host 192.168.1.1")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_ip_host_match_dst(self):
+        f = PacketFilter("ip host 10.0.0.1")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_ip_host_no_match(self):
+        f = PacketFilter("ip host 172.16.0.1")
+        ctx = self._make_http_ctx()
+        self.assertFalse(f.match(ctx))
+    
+    def test_host_shortcut(self):
+        f = PacketFilter("host 192.168.1.1")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_ether_host(self):
+        f = PacketFilter("ether host aa:bb:cc:dd:ee:ff")
+        ctx = FilterContext()
+        ctx.ethernet = parse_ethernet(build_ethernet(
+            "11:22:33:44:55:66", "aa:bb:cc:dd:ee:ff",
+            ETHERTYPE_IPV4, b"\x00" * 20
+        ))
+        self.assertTrue(f.match(ctx))
+    
+    def test_ether_src(self):
+        f = PacketFilter("ether src aa:bb:cc:dd:ee:ff")
+        ctx = FilterContext()
+        ctx.ethernet = parse_ethernet(build_ethernet(
+            "11:22:33:44:55:66", "aa:bb:cc:dd:ee:ff",
+            ETHERTYPE_IPV4, b"\x00" * 20
+        ))
+        self.assertTrue(f.match(ctx))
+    
+    def test_ether_dst(self):
+        f = PacketFilter("ether dst 11:22:33:44:55:66")
+        ctx = FilterContext()
+        ctx.ethernet = parse_ethernet(build_ethernet(
+            "11:22:33:44:55:66", "aa:bb:cc:dd:ee:ff",
+            ETHERTYPE_IPV4, b"\x00" * 20
+        ))
+        self.assertTrue(f.match(ctx))
 
 
 class TestStatistics(unittest.TestCase):
@@ -713,6 +825,91 @@ class TestNetworkAnalyzer(unittest.TestCase):
         result = analyzer.analyze(b"\x00\x01\x02")
         self.assertIsNotNone(result)
         self.assertTrue(result.ethernet.is_truncated)
+    
+    def test_udp_ntp_port_no_crash(self):
+        analyzer = NetworkAnalyzer(enable_reassembly=False)
+        
+        frame = _build_full_frame(
+            "aa:bb:cc:dd:ee:ff",
+            "11:22:33:44:55:66",
+            "192.168.1.1",
+            "10.0.0.1",
+            123,
+            123,
+            b"\x1b" + b"\x00" * 47,
+            is_tcp=False,
+        )
+        
+        result = analyzer.analyze(frame)
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result.udp)
+        self.assertEqual(result.udp.src_port, 123)
+        self.assertEqual(result.udp.dst_port, 123)
+        self.assertIsNotNone(result.app_protocol)
+    
+    def test_udp_snmp_port_no_crash(self):
+        analyzer = NetworkAnalyzer(enable_reassembly=False)
+        
+        frame = _build_full_frame(
+            "aa:bb:cc:dd:ee:ff",
+            "11:22:33:44:55:66",
+            "192.168.1.1",
+            "10.0.0.1",
+            161,
+            162,
+            b"\x30\x29\x02\x01\x00\x04\x06public\xa0\x1c\x02\x04\x01\x02\x03\x04"
+            b"\x02\x01\x00\x02\x01\x00\x30\x0e\x30\x0c\x06\x08+\x06\x01\x02\x01"
+            b"\x01\x01\x00\x05\x00",
+            is_tcp=False,
+        )
+        
+        result = analyzer.analyze(frame)
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result.udp)
+        self.assertEqual(result.udp.src_port, 161)
+        self.assertEqual(result.udp.dst_port, 162)
+        self.assertIsNotNone(result.app_protocol)
+    
+    def test_udp_ntp_with_filter(self):
+        analyzer = NetworkAnalyzer(enable_reassembly=False)
+        analyzer.set_filter("udp port 123")
+        
+        frame = _build_full_frame(
+            "aa:bb:cc:dd:ee:ff",
+            "11:22:33:44:55:66",
+            "192.168.1.1",
+            "10.0.0.1",
+            123,
+            123,
+            b"\x1b" + b"\x00" * 47,
+            is_tcp=False,
+        )
+        
+        result = analyzer.analyze(frame)
+        self.assertIsNotNone(result)
+    
+    def test_udp_ntp_stats(self):
+        analyzer = NetworkAnalyzer(enable_reassembly=False)
+        
+        for i in range(5):
+            frame = _build_full_frame(
+                "aa:bb:cc:dd:ee:ff",
+                "11:22:33:44:55:66",
+                f"192.168.1.{i+1}",
+                "10.0.0.1",
+                123,
+                123,
+                b"\x1b" + b"\x00" * 47,
+                is_tcp=False,
+            )
+            analyzer.analyze(frame)
+        
+        stats = analyzer.get_statistics()
+        self.assertEqual(stats["total_packets"], 5)
+        self.assertGreater(stats["app_proto_count"], 0)
+        
+        detailed = analyzer.get_detailed_stats()
+        self.assertIn("app_protocols", detailed)
 
 
 if __name__ == "__main__":

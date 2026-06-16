@@ -67,6 +67,8 @@ class AppProtocol(str, Enum):
     RTSP = "rtsp"
     SMB = "smb"
     RTP = "rtp"
+    NTP = "ntp"
+    SNMP = "snmp"
 
 
 class IdentificationMethod(str, Enum):
@@ -111,9 +113,9 @@ WELL_KNOWN_PORTS_UDP = {
     5060: AppProtocol.SIP,
     5004: AppProtocol.RTP,
     5005: AppProtocol.RTP,
-    123: "ntp",
-    161: "snmp",
-    162: "snmp",
+    123: AppProtocol.NTP,
+    161: AppProtocol.SNMP,
+    162: AppProtocol.SNMP,
 }
 
 
@@ -353,7 +355,7 @@ class AppProtocolIdentifier:
         
         protocol = port_map.get(dst_port) or port_map.get(src_port)
         
-        if protocol:
+        if protocol and isinstance(protocol, AppProtocol):
             return ProtocolIdentificationResult(
                 protocol=protocol,
                 method=IdentificationMethod.PORT_BASED,
