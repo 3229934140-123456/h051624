@@ -73,6 +73,7 @@ class FilterTokenType(Enum):
     IDENTIFIER = "identifier"
     NUMBER = "number"
     IP = "ip"
+    NETWORK = "network"
     MAC = "mac"
     STRING = "string"
     OP_EQ = "=="
@@ -267,10 +268,35 @@ class SimpleFilter(FilterExpression):
         if field == "dstip":
             return ctx.ip.header.dst_ip if ctx.ip else None
         
+        if field == "srcnet":
+            return ctx.ip.header.src_ip if ctx.ip else None
+        if field == "dstnet":
+            return ctx.ip.header.dst_ip if ctx.ip else None
+        if field == "ip.net":
+            return [ctx.ip.header.src_ip, ctx.ip.header.dst_ip] if ctx.ip else None
+        
         return None
     
     def _compare(self, actual: Any, expected: Any) -> bool:
+        is_cidr = isinstance(expected, str) and "/" in expected and expected.count(".") == 3
+        
         if isinstance(actual, list):
+            if is_cidr:
+                try:
+                    network = ipaddress.IPv4Network(expected, strict=False)
+                    if self.operator == FilterOperator.EQ:
+                        return any(
+                            ipaddress.IPv4Address(a) in network
+                            for a in actual if isinstance(a, str)
+                        )
+                    if self.operator == FilterOperator.NEQ:
+                        return all(
+                            ipaddress.IPv4Address(a) not in network
+                            for a in actual if isinstance(a, str)
+                        )
+                except (ValueError, TypeError):
+                    return False
+            
             if self.operator == FilterOperator.EQ:
                 if isinstance(expected, str):
                     return any(
@@ -299,6 +325,17 @@ class SimpleFilter(FilterExpression):
             if self.operator == FilterOperator.GE:
                 return min(actual_vals) >= expected_val
             return False
+        
+        if is_cidr and isinstance(actual, str):
+            try:
+                network = ipaddress.IPv4Network(expected, strict=False)
+                ip = ipaddress.IPv4Address(actual)
+                if self.operator == FilterOperator.EQ:
+                    return ip in network
+                if self.operator == FilterOperator.NEQ:
+                    return ip not in network
+            except (ValueError, TypeError):
+                return False
         
         if self.operator == FilterOperator.EQ:
             if isinstance(actual, str) and isinstance(expected, str):
@@ -464,8 +501,26 @@ class FilterParser:
             
             if s[i].isdigit():
                 j = i
+                has_colon = False
+                has_alpha = False
+                
                 while j < len(s) and (s[j].isdigit() or s[j] in ".:"):
+                    if s[j] == ":":
+                        has_colon = True
                     j += 1
+                
+                if j < len(s) and s[j].isalpha() and not has_colon and j == i + 1:
+                    while j < len(s) and (s[j].isalnum() or s[j] in "._-:"):
+                        if s[j] == ":":
+                            has_colon = True
+                        if s[j].isalpha():
+                            has_alpha = True
+                        j += 1
+                
+                if has_colon:
+                    while j < len(s) and (s[j].isalnum() or s[j] == ":"):
+                        j += 1
+                
                 num_str = s[i:j]
                 
                 if re.match(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$", num_str):
@@ -476,9 +531,31 @@ class FilterParser:
                 if num_str.count(".") == 3 and ":" not in num_str:
                     try:
                         ipaddress.IPv4Address(num_str)
-                        self.tokens.append(FilterToken(type=FilterTokenType.IP, value=num_str, position=i))
-                        i = j
-                        continue
+                        has_slash = False
+                        slash_pos = j
+                        if j < len(s) and s[j] == "/":
+                            slash_pos = j + 1
+                            while slash_pos < len(s) and s[slash_pos].isdigit():
+                                slash_pos += 1
+                            if slash_pos > j + 1:
+                                prefix_len = int(s[j+1:slash_pos])
+                                if 0 <= prefix_len <= 32:
+                                    has_slash = True
+                                    j = slash_pos
+                        
+                        if has_slash:
+                            network_str = s[i:j]
+                            try:
+                                ipaddress.IPv4Network(network_str, strict=False)
+                                self.tokens.append(FilterToken(type=FilterTokenType.NETWORK, value=network_str, position=i))
+                                i = j
+                                continue
+                            except ValueError:
+                                pass
+                        else:
+                            self.tokens.append(FilterToken(type=FilterTokenType.IP, value=num_str, position=i))
+                            i = j
+                            continue
                     except ValueError:
                         pass
                 
@@ -612,6 +689,7 @@ class FilterParser:
             if self.pos < len(self.tokens) and self.tokens[self.pos].type in (
                 FilterTokenType.NUMBER,
                 FilterTokenType.IP,
+                FilterTokenType.NETWORK,
                 FilterTokenType.MAC,
                 FilterTokenType.STRING,
                 FilterTokenType.IDENTIFIER,
@@ -736,6 +814,8 @@ class FilterParser:
                 return "srcport"
             if len(parts) == 2 and parts[1] == "host":
                 return "srcip"
+            if len(parts) == 2 and parts[1] == "net":
+                return "srcnet"
             return "srcip"
         
         if first == "dst":
@@ -743,10 +823,15 @@ class FilterParser:
                 return "dstport"
             if len(parts) == 2 and parts[1] == "host":
                 return "dstip"
+            if len(parts) == 2 and parts[1] == "net":
+                return "dstnet"
             return "dstip"
         
         if first == "host":
             return "ip.host"
+        
+        if first == "net":
+            return "ip.net"
         
         if first == "port":
             return "port"

@@ -37,6 +37,9 @@
 """
 
 import time
+import json
+import csv
+import io
 import threading
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, List, Optional, Any
@@ -567,6 +570,247 @@ class StatisticsCollector:
             }
             
             return summary
+    
+    def export_json(self, pretty: bool = True) -> str:
+        """
+        导出所有统计为JSON格式
+        
+        Args:
+            pretty: 是否格式化输出
+            
+        Returns:
+            str: JSON格式的统计数据
+        """
+        with self._lock:
+            data = {}
+            
+            g = self._global
+            data["global"] = {
+                "total_packets": g.total_packets,
+                "total_bytes": g.total_bytes,
+                "truncated_packets": g.truncated_packets,
+                "error_packets": g.error_packets,
+                "start_time": g.start_time,
+                "last_packet_time": g.last_packet_time,
+                "duration": g.duration,
+                "avg_packet_size": g.avg_packet_size,
+                "packets_per_second": g.packets_per_second,
+                "bytes_per_second": g.bytes_per_second,
+                "min_packet_size": g.min_packet_size,
+                "max_packet_size": g.max_packet_size,
+                "total_payload_bytes": g.total_payload_bytes,
+            }
+            
+            from network_analyzer.utils.packet_utils import ETHERTYPE_NAME, IP_PROTO_NAME
+            
+            data["ethernet_protocols"] = {}
+            for eth_type, stats in self._ethertype_stats.items():
+                name = ETHERTYPE_NAME.get(eth_type, f"0x{eth_type:04x}")
+                data["ethernet_protocols"][name] = {
+                    "packet_count": stats.packet_count,
+                    "byte_count": stats.byte_count,
+                }
+            
+            data["ip_protocols"] = {}
+            for proto, stats in self._ip_proto_stats.items():
+                name = IP_PROTO_NAME.get(proto, str(proto))
+                data["ip_protocols"][name] = {
+                    "packet_count": stats.packet_count,
+                    "byte_count": stats.byte_count,
+                }
+            
+            data["application_protocols"] = {}
+            for proto, stats in self._app_proto_stats.items():
+                data["application_protocols"][proto] = {
+                    "packet_count": stats.packet_count,
+                    "byte_count": stats.byte_count,
+                }
+            
+            data["connections"] = []
+            for conn in sorted(
+                self._connection_stats.values(),
+                key=lambda c: c.byte_count,
+                reverse=True
+            ):
+                data["connections"].append({
+                    "src_ip": conn.five_tuple[0],
+                    "src_port": conn.five_tuple[1],
+                    "dst_ip": conn.five_tuple[2],
+                    "dst_port": conn.five_tuple[3],
+                    "protocol": "TCP" if conn.five_tuple[4] == 6 else "UDP",
+                    "packet_count": conn.packet_count,
+                    "byte_count": conn.byte_count,
+                    "client_packets": conn.client_packets,
+                    "server_packets": conn.server_packets,
+                    "client_bytes": conn.client_bytes,
+                    "server_bytes": conn.server_bytes,
+                    "start_time": conn.start_time,
+                    "last_time": conn.last_time,
+                    "duration": conn.duration,
+                    "state": conn.state,
+                    "app_protocol": conn.app_protocol,
+                })
+            
+            data["hosts"] = []
+            for host in sorted(
+                self._host_stats.values(),
+                key=lambda h: h.total_bytes,
+                reverse=True
+            ):
+                data["hosts"].append({
+                    "ip": host.ip,
+                    "packets_sent": host.packets_sent,
+                    "packets_received": host.packets_received,
+                    "total_packets": host.total_packets,
+                    "bytes_sent": host.bytes_sent,
+                    "bytes_received": host.bytes_received,
+                    "total_bytes": host.total_bytes,
+                    "connections": host.connections,
+                })
+            
+            data["tcp_ports"] = {}
+            for port, stats in sorted(
+                self._tcp_port_stats.items(),
+                key=lambda x: x[1].byte_count,
+                reverse=True
+            ):
+                data["tcp_ports"][port] = {
+                    "packet_count": stats.packet_count,
+                    "byte_count": stats.byte_count,
+                }
+            
+            data["udp_ports"] = {}
+            for port, stats in sorted(
+                self._udp_port_stats.items(),
+                key=lambda x: x[1].byte_count,
+                reverse=True
+            ):
+                data["udp_ports"][port] = {
+                    "packet_count": stats.packet_count,
+                    "byte_count": stats.byte_count,
+                }
+            
+            data["time_series"] = {
+                "window_seconds": self._time_window.window_seconds,
+                "timestamps": self._time_window.timestamps,
+                "packet_counts": self._time_window.packet_counts,
+                "byte_counts": self._time_window.byte_counts,
+            }
+            
+            indent = 2 if pretty else None
+            return json.dumps(data, indent=indent, default=str)
+    
+    def export_csv(self, section: str = "all") -> Dict[str, str]:
+        """
+        导出统计为CSV格式
+        
+        Args:
+            section: 导出的部分 ("all", "connections", "hosts", 
+                     "app_protocols", "tcp_ports", "udp_ports", "time_series")
+            
+        Returns:
+            Dict[str, str]: 各部分对应的CSV字符串
+        """
+        with self._lock:
+            result = {}
+            
+            sections = [section] if section != "all" else [
+                "connections", "hosts", "app_protocols", 
+                "tcp_ports", "udp_ports", "time_series",
+            ]
+            
+            if "connections" in sections:
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow([
+                    "src_ip", "src_port", "dst_ip", "dst_port", "protocol",
+                    "packet_count", "byte_count", "client_packets", "server_packets",
+                    "client_bytes", "server_bytes", "duration", "state", "app_protocol"
+                ])
+                for conn in sorted(
+                    self._connection_stats.values(),
+                    key=lambda c: c.byte_count,
+                    reverse=True
+                ):
+                    proto = "TCP" if conn.five_tuple[4] == 6 else "UDP"
+                    writer.writerow([
+                        conn.five_tuple[0], conn.five_tuple[1],
+                        conn.five_tuple[2], conn.five_tuple[3],
+                        proto, conn.packet_count, conn.byte_count,
+                        conn.client_packets, conn.server_packets,
+                        conn.client_bytes, conn.server_bytes,
+                        round(conn.duration, 6), conn.state, conn.app_protocol
+                    ])
+                result["connections"] = output.getvalue()
+            
+            if "hosts" in sections:
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow([
+                    "ip", "packets_sent", "packets_received", "total_packets",
+                    "bytes_sent", "bytes_received", "total_bytes", "connections"
+                ])
+                for host in sorted(
+                    self._host_stats.values(),
+                    key=lambda h: h.total_bytes,
+                    reverse=True
+                ):
+                    writer.writerow([
+                        host.ip, host.packets_sent, host.packets_received,
+                        host.total_packets, host.bytes_sent, host.bytes_received,
+                        host.total_bytes, host.connections
+                    ])
+                result["hosts"] = output.getvalue()
+            
+            if "app_protocols" in sections:
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(["protocol", "packet_count", "byte_count"])
+                for proto, stats in sorted(
+                    self._app_proto_stats.items(),
+                    key=lambda x: x[1].byte_count,
+                    reverse=True
+                ):
+                    writer.writerow([proto, stats.packet_count, stats.byte_count])
+                result["app_protocols"] = output.getvalue()
+            
+            if "tcp_ports" in sections:
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(["port", "packet_count", "byte_count"])
+                for port, stats in sorted(
+                    self._tcp_port_stats.items(),
+                    key=lambda x: x[1].byte_count,
+                    reverse=True
+                ):
+                    writer.writerow([port, stats.packet_count, stats.byte_count])
+                result["tcp_ports"] = output.getvalue()
+            
+            if "udp_ports" in sections:
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(["port", "packet_count", "byte_count"])
+                for port, stats in sorted(
+                    self._udp_port_stats.items(),
+                    key=lambda x: x[1].byte_count,
+                    reverse=True
+                ):
+                    writer.writerow([port, stats.packet_count, stats.byte_count])
+                result["udp_ports"] = output.getvalue()
+            
+            if "time_series" in sections:
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(["timestamp", "packet_count", "byte_count"])
+                for i in range(len(self._time_window.timestamps)):
+                    writer.writerow([
+                        self._time_window.timestamps[i],
+                        self._time_window.packet_counts[i],
+                        self._time_window.byte_counts[i]
+                    ])
+                result["time_series"] = output.getvalue()
+            
+            return result
     
     def reset(self):
         """重置所有统计"""

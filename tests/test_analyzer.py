@@ -457,6 +457,55 @@ class TestAppProtocolIdentification(unittest.TestCase):
         data = b"\x00\x01\x02\x03\x04"
         proto = identify_protocol(data, 9999, 8888, is_tcp=True)
         self.assertEqual(proto, AppProtocol.UNKNOWN)
+    
+    def test_ntp_client(self):
+        ntp_packet = b"\xe3\x00\x00\x00" + b"\x00" * 44
+        identifier = AppProtocolIdentifier()
+        result = identifier.identify(ntp_packet, 12345, 123, is_tcp=False)
+        self.assertEqual(result.protocol, AppProtocol.NTP)
+        self.assertGreater(result.confidence, 0.6)
+    
+    def test_ntp_port(self):
+        proto = identify_protocol(b"", 12345, 123, is_tcp=False)
+        self.assertEqual(proto, AppProtocol.NTP)
+    
+    def test_snmp_get(self):
+        snmp_data = (
+            b"\x30\x29\x02\x01\x00\x04\x06public\xa0\x1c\x02\x04\x01\x02\x03\x04"
+            b"\x02\x01\x00\x02\x01\x00\x30\x0e\x30\x0c\x06\x08+\x06\x01\x02\x01"
+            b"\x01\x01\x00\x05\x00"
+        )
+        identifier = AppProtocolIdentifier()
+        result = identifier.identify(snmp_data, 12345, 161, is_tcp=False)
+        self.assertEqual(result.protocol, AppProtocol.SNMP)
+        self.assertGreater(result.confidence, 0.7)
+        self.assertIn("community", result.details)
+    
+    def test_snmp_port(self):
+        proto = identify_protocol(b"", 161, 12345, is_tcp=False)
+        self.assertEqual(proto, AppProtocol.SNMP)
+    
+    def test_dhcp_discover(self):
+        dhcp_data = bytearray(244)
+        dhcp_data[0] = 0x01
+        dhcp_data[1] = 0x01
+        dhcp_data[2] = 0x06
+        dhcp_data[4:8] = b"\x12\x34\x56\x78"
+        dhcp_data[28:34] = b"\xaa\xbb\xcc\xdd\xee\xff"
+        dhcp_data[236:240] = b"\x63\x82\x53\x63"
+        dhcp_data[240] = 53
+        dhcp_data[241] = 1
+        dhcp_data[242] = 1
+        dhcp_data[243] = 255
+        identifier = AppProtocolIdentifier()
+        result = identifier.identify(bytes(dhcp_data), 68, 67, is_tcp=False)
+        self.assertEqual(result.protocol, AppProtocol.DHCP)
+        self.assertGreater(result.confidence, 0.7)
+        self.assertIn("message_type", result.details)
+    
+    def test_dhcp_port(self):
+        proto = identify_protocol(b"", 67, 68, is_tcp=False)
+        self.assertEqual(proto, AppProtocol.DHCP)
 
 
 class TestFilter(unittest.TestCase):
@@ -637,6 +686,73 @@ class TestFilter(unittest.TestCase):
             ETHERTYPE_IPV4, b"\x00" * 20
         ))
         self.assertTrue(f.match(ctx))
+    
+    def test_mac_mixed_digit_letter(self):
+        f = PacketFilter("ether host 11:aa:bb:cc:dd:ee")
+        ctx = FilterContext()
+        ctx.ethernet = parse_ethernet(build_ethernet(
+            "11:aa:bb:cc:dd:ee", "22:33:44:55:66:77",
+            ETHERTYPE_IPV4, b"\x00" * 20
+        ))
+        self.assertTrue(f.match(ctx))
+    
+    def test_mac_digit_letter_src(self):
+        f = PacketFilter("ether src 1a:2b:3c:4d:5e:6f")
+        ctx = FilterContext()
+        ctx.ethernet = parse_ethernet(build_ethernet(
+            "00:11:22:33:44:55", "1a:2b:3c:4d:5e:6f",
+            ETHERTYPE_IPV4, b"\x00" * 20
+        ))
+        self.assertTrue(f.match(ctx))
+    
+    def test_mac_digit_letter_dst(self):
+        f = PacketFilter("ether dst 1a:2b:3c:4d:5e:6f")
+        ctx = FilterContext()
+        ctx.ethernet = parse_ethernet(build_ethernet(
+            "1a:2b:3c:4d:5e:6f", "00:11:22:33:44:55",
+            ETHERTYPE_IPV4, b"\x00" * 20
+        ))
+        self.assertTrue(f.match(ctx))
+    
+    def test_src_net_match(self):
+        f = PacketFilter("src net 192.168.1.0/24")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_src_net_no_match(self):
+        f = PacketFilter("src net 10.0.0.0/8")
+        ctx = self._make_http_ctx()
+        self.assertFalse(f.match(ctx))
+    
+    def test_dst_net_match(self):
+        f = PacketFilter("dst net 10.0.0.0/8")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_net_match(self):
+        f = PacketFilter("net 192.168.1.0/24")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_net_no_match(self):
+        f = PacketFilter("net 172.16.0.0/12")
+        ctx = self._make_http_ctx()
+        self.assertFalse(f.match(ctx))
+    
+    def test_tcp_or_udp(self):
+        f = PacketFilter("tcp or udp")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_src_host_and_dst_port(self):
+        f = PacketFilter("src host 192.168.1.1 and dst port 80")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_src_net_and_tcp(self):
+        f = PacketFilter("src net 192.168.1.0/24 and tcp")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
 
 
 class TestStatistics(unittest.TestCase):
@@ -705,6 +821,75 @@ class TestStatistics(unittest.TestCase):
         
         summary = stats.get_summary()
         self.assertEqual(summary["total_packets"], 0)
+    
+    def test_export_json(self):
+        stats = StatisticsCollector()
+        ctx = self._make_ctx()
+        stats.record_packet(ctx)
+        
+        json_str = stats.export_json()
+        self.assertIsInstance(json_str, str)
+        self.assertIn("global", json_str)
+        self.assertIn("connections", json_str)
+        self.assertIn("hosts", json_str)
+        self.assertIn("application_protocols", json_str)
+        
+        import json
+        data = json.loads(json_str)
+        self.assertEqual(data["global"]["total_packets"], 1)
+    
+    def test_export_json_compact(self):
+        stats = StatisticsCollector()
+        ctx = self._make_ctx()
+        stats.record_packet(ctx)
+        
+        json_str = stats.export_json(pretty=False)
+        self.assertIsInstance(json_str, str)
+        import json
+        data = json.loads(json_str)
+        self.assertEqual(data["global"]["total_packets"], 1)
+    
+    def test_export_csv_all(self):
+        stats = StatisticsCollector()
+        ctx = self._make_ctx()
+        stats.record_packet(ctx)
+        
+        csv_data = stats.export_csv("all")
+        self.assertIsInstance(csv_data, dict)
+        self.assertIn("connections", csv_data)
+        self.assertIn("hosts", csv_data)
+        self.assertIn("app_protocols", csv_data)
+        self.assertIn("tcp_ports", csv_data)
+        self.assertIn("udp_ports", csv_data)
+        self.assertIn("time_series", csv_data)
+    
+    def test_export_csv_connections(self):
+        stats = StatisticsCollector()
+        ctx = self._make_ctx()
+        stats.record_packet(ctx)
+        
+        csv_data = stats.export_csv("connections")
+        self.assertIn("connections", csv_data)
+        self.assertIn("src_ip", csv_data["connections"])
+        self.assertIn("dst_ip", csv_data["connections"])
+    
+    def test_export_csv_hosts(self):
+        stats = StatisticsCollector()
+        ctx = self._make_ctx()
+        stats.record_packet(ctx)
+        
+        csv_data = stats.export_csv("hosts")
+        self.assertIn("hosts", csv_data)
+        self.assertIn("ip", csv_data["hosts"])
+        self.assertIn("total_bytes", csv_data["hosts"])
+    
+    def test_export_csv_app_protocols(self):
+        stats = StatisticsCollector()
+        ctx = self._make_ctx()
+        stats.record_packet(ctx)
+        
+        csv_data = stats.export_csv("app_protocols")
+        self.assertIn("app_protocols", csv_data)
 
 
 class TestNetworkAnalyzer(unittest.TestCase):

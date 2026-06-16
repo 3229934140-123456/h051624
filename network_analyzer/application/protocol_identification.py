@@ -297,6 +297,9 @@ class AppProtocolIdentifier:
             ("pop3", self._check_pop3),
             ("imap", self._check_imap),
             ("dns", self._check_dns),
+            ("dhcp", self._check_dhcp),
+            ("ntp", self._check_ntp),
+            ("snmp", self._check_snmp),
             ("redis", self._check_redis),
             ("mqtt", self._check_mqtt),
             ("mysql", self._check_mysql),
@@ -711,6 +714,216 @@ class AppProtocolIdentifier:
                     return True, 0.7, details
         
         return False, 0.0, details
+    
+    def _check_ntp(self, data: bytes) -> Tuple[bool, float, Dict]:
+        """检查是否是NTP协议"""
+        details = {}
+        
+        if len(data) < 48:
+            return False, 0.0, details
+        
+        first_byte = data[0]
+        li = (first_byte >> 6) & 0x03
+        version = (first_byte >> 3) & 0x07
+        mode = first_byte & 0x07
+        
+        if version < 1 or version > 4:
+            return False, 0.0, details
+        
+        if mode < 1 or mode > 7:
+            return False, 0.0, details
+        
+        mode_names = {
+            1: "active",
+            2: "passive",
+            3: "client",
+            4: "server",
+            5: "broadcast",
+            6: "control",
+            7: "private",
+        }
+        
+        details["version"] = version
+        details["mode"] = mode_names.get(mode, str(mode))
+        details["leap_indicator"] = li
+        
+        stratum = data[1]
+        if stratum <= 16:
+            details["stratum"] = stratum
+        
+        if len(data) >= 48 and mode == 4:
+            try:
+                from datetime import datetime, timezone
+                transmit_ts = int.from_bytes(data[40:44], "big")
+                if transmit_ts > 0:
+                    ntp_epoch = 2208988800
+                    unix_ts = transmit_ts - ntp_epoch
+                    if unix_ts > 0:
+                        details["transmit_timestamp"] = datetime.fromtimestamp(unix_ts, tz=timezone.utc).isoformat()
+            except Exception:
+                pass
+        
+        confidence = 0.7
+        if stratum == 0 and mode == 3:
+            confidence = 0.75
+        if mode == 4 and 1 <= stratum <= 16:
+            confidence = 0.8
+        
+        return True, confidence, details
+    
+    def _check_snmp(self, data: bytes) -> Tuple[bool, float, Dict]:
+        """检查是否是SNMP协议"""
+        details = {}
+        
+        if len(data) < 10:
+            return False, 0.0, details
+        
+        if data[0] != 0x30:
+            return False, 0.0, details
+        
+        pos = 1
+        if pos >= len(data):
+            return False, 0.0, details
+        
+        seq_len = data[pos]
+        pos += 1
+        if seq_len & 0x80:
+            len_bytes = seq_len & 0x7f
+            if pos + len_bytes > len(data):
+                return False, 0.0, details
+            seq_len = int.from_bytes(data[pos:pos+len_bytes], "big")
+            pos += len_bytes
+        
+        if pos + 2 > len(data):
+            return False, 0.0, details
+        
+        if data[pos] != 0x02:
+            return False, 0.0, details
+        
+        pos += 1
+        ver_len = data[pos]
+        pos += 1
+        if pos + ver_len > len(data):
+            return False, 0.0, details
+        version = int.from_bytes(data[pos:pos+ver_len], "big")
+        pos += ver_len
+        
+        if version > 3:
+            return False, 0.0, details
+        
+        if pos >= len(data) or data[pos] != 0x04:
+            return False, 0.0, details
+        
+        pos += 1
+        comm_len = data[pos]
+        pos += 1
+        if pos + comm_len > len(data):
+            return False, 0.0, details
+        community = data[pos:pos+comm_len]
+        pos += comm_len
+        
+        if pos >= len(data):
+            return False, 0.0, details
+        
+        pdu_type = data[pos]
+        pdu_names = {
+            0xa0: "GetRequest",
+            0xa1: "GetNextRequest",
+            0xa2: "GetResponse",
+            0xa3: "SetRequest",
+            0xa4: "Trap",
+            0xa5: "GetBulkRequest",
+            0xa6: "InformRequest",
+            0xa7: "TrapV2",
+            0xa8: "Report",
+        }
+        
+        if pdu_type not in pdu_names:
+            return False, 0.0, details
+        
+        details["version"] = f"v{version + 1}"
+        details["community"] = community.decode("ascii", errors="replace")
+        details["pdu_type"] = pdu_names.get(pdu_type, hex(pdu_type))
+        
+        return True, 0.85, details
+    
+    def _check_dhcp(self, data: bytes) -> Tuple[bool, float, Dict]:
+        """检查是否是DHCP协议"""
+        details = {}
+        
+        if len(data) < 240:
+            return False, 0.0, details
+        
+        op = data[0]
+        htype = data[1]
+        hlen = data[2]
+        
+        if op not in (1, 2):
+            return False, 0.0, details
+        
+        if htype != 1:
+            return False, 0.0, details
+        
+        if hlen != 6:
+            return False, 0.0, details
+        
+        magic_cookie = data[236:240]
+        if magic_cookie != b"\x63\x82\x53\x63":
+            return False, 0.0, details
+        
+        details["op"] = "request" if op == 1 else "reply"
+        details["htype"] = "ethernet"
+        details["xid"] = hex(int.from_bytes(data[4:8], "big"))
+        
+        chaddr = data[28:28+hlen]
+        details["client_mac"] = ":".join(f"{b:02x}" for b in chaddr)
+        
+        ciaddr = data[12:16]
+        if ciaddr != b"\x00\x00\x00\x00":
+            details["client_ip"] = ".".join(str(b) for b in ciaddr)
+        
+        yiaddr = data[16:20]
+        if yiaddr != b"\x00\x00\x00\x00":
+            details["your_ip"] = ".".join(str(b) for b in yiaddr)
+        
+        msg_type = None
+        pos = 240
+        while pos < len(data) - 2:
+            opt_code = data[pos]
+            if opt_code == 0:
+                pos += 1
+                continue
+            if opt_code == 255:
+                break
+            if pos + 1 >= len(data):
+                break
+            opt_len = data[pos + 1]
+            if pos + 2 + opt_len > len(data):
+                break
+            
+            if opt_code == 53 and opt_len == 1:
+                msg_types = {
+                    1: "DHCPDISCOVER",
+                    2: "DHCPOFFER",
+                    3: "DHCPREQUEST",
+                    4: "DHCPDECLINE",
+                    5: "DHCPACK",
+                    6: "DHCPNAK",
+                    7: "DHCPRELEASE",
+                    8: "DHCPINFORM",
+                }
+                msg_type = data[pos + 2]
+                details["message_type"] = msg_types.get(msg_type, f"type_{msg_type}")
+            
+            if opt_code == 12 and opt_len > 0:
+                hostname = data[pos+2:pos+2+opt_len].decode("ascii", errors="replace")
+                details["hostname"] = hostname
+            
+            pos += 2 + opt_len
+        
+        confidence = 0.9 if msg_type else 0.8
+        
+        return True, confidence, details
     
     def reset(self):
         """重置识别器"""

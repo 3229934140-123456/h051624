@@ -450,6 +450,22 @@ class NetworkAnalyzer:
             "time_series": self._stats.get_time_series(),
         }
     
+    def export_stats_json(self, pretty: bool = True) -> str:
+        """导出统计数据为JSON格式"""
+        return self._stats.export_json(pretty=pretty)
+    
+    def export_stats_csv(self, section: str = "all") -> Dict[str, str]:
+        """导出统计数据为CSV格式
+        
+        Args:
+            section: 导出的部分 ("all", "connections", "hosts", 
+                     "app_protocols", "tcp_ports", "udp_ports", "time_series")
+        
+        Returns:
+            Dict[str, str]: 各部分对应的CSV字符串
+        """
+        return self._stats.export_csv(section=section)
+    
     def get_all_streams(self) -> List[StreamData]:
         """获取所有TCP流"""
         with self._lock:

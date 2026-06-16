@@ -8,6 +8,45 @@ import struct
 import socket
 
 
+ETHERTYPE_IPV4 = 0x0800
+ETHERTYPE_ARP = 0x0806
+ETHERTYPE_IPV6 = 0x86DD
+ETHERTYPE_VLAN = 0x8100
+
+ETHERTYPE_NAME = {
+    0x0800: "IPv4",
+    0x0806: "ARP",
+    0x86DD: "IPv6",
+    0x8100: "VLAN",
+    0x8035: "RARP",
+    0x88CC: "LLDP",
+    0x8808: "EthernetFlowControl",
+    0x8847: "MPLS",
+    0x8863: "PPPoEDiscovery",
+    0x8864: "PPPoESession",
+}
+
+IP_PROTO_ICMP = 1
+IP_PROTO_TCP = 6
+IP_PROTO_UDP = 17
+IP_PROTO_ICMPV6 = 58
+
+IP_PROTO_NAME = {
+    0: "HOPOPT",
+    1: "ICMP",
+    2: "IGMP",
+    6: "TCP",
+    17: "UDP",
+    41: "IPv6",
+    47: "GRE",
+    50: "ESP",
+    51: "AH",
+    58: "ICMPv6",
+    89: "OSPF",
+    132: "SCTP",
+}
+
+
 def mac_bytes_to_str(mac_bytes):
     """将6字节MAC地址转换为字符串格式"""
     return ":".join(f"{b:02x}" for b in mac_bytes)
