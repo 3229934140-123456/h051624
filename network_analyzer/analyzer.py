@@ -130,12 +130,13 @@ class NetworkAnalyzer:
         streams = analyzer.get_all_streams()
     """
     
-    def __init__(self, enable_reassembly: bool = True):
+    def __init__(self, enable_reassembly: bool = True, time_window_seconds: int = 1):
         """
         初始化网络协议分析器
         
         Args:
             enable_reassembly: 是否启用IP分片重组和TCP流重组
+            time_window_seconds: 时间窗口统计的窗口大小（秒）
         """
         self.enable_reassembly = enable_reassembly
         
@@ -146,7 +147,7 @@ class NetworkAnalyzer:
         self._tcp_reassembler = TCPStreamReassembler(timeout=300.0)
         self._app_identifier = AppProtocolIdentifier()
         self._filter: Optional[PacketFilter] = None
-        self._stats = StatisticsCollector()
+        self._stats = StatisticsCollector(time_window_seconds=time_window_seconds)
         
         self._stream_data: Dict[Tuple, StreamData] = {}
         
@@ -465,6 +466,118 @@ class NetworkAnalyzer:
             Dict[str, str]: 各部分对应的CSV字符串
         """
         return self._stats.export_csv(section=section)
+    
+    def set_time_window(self, window_seconds: int):
+        """设置时间窗口大小（会重置现有窗口数据）
+        
+        Args:
+            window_seconds: 窗口大小（秒），如 1、5、60
+        """
+        self._stats.set_time_window(window_seconds)
+    
+    def get_time_series(self) -> Dict[str, Any]:
+        """获取时间序列数据
+        
+        Returns:
+            包含时间戳、包数、字节数，以及TCP/UDP/应用协议分布的字典
+        """
+        return self._stats.get_time_series()
+    
+    def get_sessions(
+        self,
+        protocol: Optional[str] = None,
+        port: Optional[int] = None,
+        port_range: Optional[tuple] = None,
+        app_protocol: Optional[str] = None,
+        sort_by: str = "byte_count",
+        limit: Optional[int] = None,
+    ) -> list:
+        """获取会话列表，支持按条件筛选
+        
+        Args:
+            protocol: 传输层协议筛选 ("tcp" 或 "udp")
+            port: 端口筛选（源或目的端口匹配）
+            port_range: 端口范围筛选 (min_port, max_port)
+            app_protocol: 应用层协议筛选
+            sort_by: 排序字段 (byte_count, packet_count, duration, start_time)
+            limit: 返回数量限制
+        
+        Returns:
+            筛选后的会话列表
+        """
+        return self._stats.get_sessions(
+            protocol=protocol,
+            port=port,
+            port_range=port_range,
+            app_protocol=app_protocol,
+            sort_by=sort_by,
+            limit=limit,
+        )
+    
+    def export_sessions_json(
+        self,
+        protocol: Optional[str] = None,
+        port: Optional[int] = None,
+        port_range: Optional[tuple] = None,
+        app_protocol: Optional[str] = None,
+        sort_by: str = "byte_count",
+        limit: Optional[int] = None,
+        pretty: bool = True,
+    ) -> str:
+        """导出会话明细为JSON格式
+        
+        Args:
+            protocol: 传输层协议筛选
+            port: 端口筛选
+            port_range: 端口范围筛选 (min_port, max_port)
+            app_protocol: 应用层协议筛选
+            sort_by: 排序字段
+            limit: 返回数量限制
+            pretty: 是否格式化输出
+        
+        Returns:
+            str: JSON格式的会话列表
+        """
+        return self._stats.export_sessions_json(
+            protocol=protocol,
+            port=port,
+            port_range=port_range,
+            app_protocol=app_protocol,
+            sort_by=sort_by,
+            limit=limit,
+            pretty=pretty,
+        )
+    
+    def export_sessions_csv(
+        self,
+        protocol: Optional[str] = None,
+        port: Optional[int] = None,
+        port_range: Optional[tuple] = None,
+        app_protocol: Optional[str] = None,
+        sort_by: str = "byte_count",
+        limit: Optional[int] = None,
+    ) -> str:
+        """导出会话明细为CSV格式
+        
+        Args:
+            protocol: 传输层协议筛选
+            port: 端口筛选
+            port_range: 端口范围筛选 (min_port, max_port)
+            app_protocol: 应用层协议筛选
+            sort_by: 排序字段
+            limit: 返回数量限制
+        
+        Returns:
+            str: CSV格式的会话列表
+        """
+        return self._stats.export_sessions_csv(
+            protocol=protocol,
+            port=port,
+            port_range=port_range,
+            app_protocol=app_protocol,
+            sort_by=sort_by,
+            limit=limit,
+        )
     
     def get_all_streams(self) -> List[StreamData]:
         """获取所有TCP流"""

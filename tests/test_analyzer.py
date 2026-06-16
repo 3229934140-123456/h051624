@@ -753,23 +753,93 @@ class TestFilter(unittest.TestCase):
         f = PacketFilter("src net 192.168.1.0/24 and tcp")
         ctx = self._make_http_ctx()
         self.assertTrue(f.match(ctx))
+    
+    def test_portrange(self):
+        f = PacketFilter("portrange 1-1024")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_portrange_not_match(self):
+        f = PacketFilter("portrange 20000-30000")
+        ctx = self._make_http_ctx()
+        self.assertFalse(f.match(ctx))
+    
+    def test_src_portrange(self):
+        f = PacketFilter("src portrange 10000-20000")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_dst_portrange(self):
+        f = PacketFilter("dst portrange 1-100")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_tcp_src_portrange(self):
+        f = PacketFilter("tcp src portrange 10000-15000")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_tcp_dst_portrange(self):
+        f = PacketFilter("tcp dst portrange 1-100")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_less_operator(self):
+        f = PacketFilter("ip len less 1000")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_greater_operator(self):
+        f = PacketFilter("ip len greater 10")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_less_not_match(self):
+        f = PacketFilter("ip len less 10")
+        ctx = self._make_http_ctx()
+        self.assertFalse(f.match(ctx))
+    
+    def test_greater_not_match(self):
+        f = PacketFilter("ip len greater 10000")
+        ctx = self._make_http_ctx()
+        self.assertFalse(f.match(ctx))
+    
+    def test_combined_portrange_and_host(self):
+        f = PacketFilter("dst host 10.0.0.1 and dst portrange 1-1024")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
+    
+    def test_combined_net_and_greater(self):
+        f = PacketFilter("src net 192.168.1.0/24 and ip len greater 10")
+        ctx = self._make_http_ctx()
+        self.assertTrue(f.match(ctx))
 
 
 class TestStatistics(unittest.TestCase):
     """统计模块测试"""
     
-    def _make_ctx(self):
+    def _make_ctx(self, src_ip="192.168.1.1", dst_ip="10.0.0.1",
+                  src_port=12345, dst_port=80, is_tcp=True):
         ctx = FilterContext()
+        if is_tcp:
+            payload = build_tcp(src_port, dst_port, payload=b"test",
+                               src_ip=src_ip, dst_ip=dst_ip)
+            proto = IP_PROTO_TCP
+        else:
+            payload = build_udp(src_port, dst_port, b"test")
+            proto = IP_PROTO_UDP
+        
         ctx.ethernet = parse_ethernet(build_ethernet(
             "aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66",
             ETHERTYPE_IPV4,
-            build_ipv4("192.168.1.1", "10.0.0.1", IP_PROTO_TCP,
-                build_tcp(12345, 80, payload=b"test",
-                         src_ip="192.168.1.1", dst_ip="10.0.0.1"))
+            build_ipv4(src_ip, dst_ip, proto, payload)
         ))
         ctx.ip = parse_ipv4(ctx.ethernet.payload)
-        ctx.tcp = parse_tcp(ctx.ip.payload, "192.168.1.1", "10.0.0.1")
-        ctx.app_protocol = "http"
+        if is_tcp:
+            ctx.tcp = parse_tcp(ctx.ip.payload, src_ip, dst_ip)
+        else:
+            ctx.udp = parse_udp(ctx.ip.payload)
+        ctx.app_protocol = "http" if is_tcp else None
         return ctx
     
     def test_global_stats(self):
@@ -890,6 +960,134 @@ class TestStatistics(unittest.TestCase):
         
         csv_data = stats.export_csv("app_protocols")
         self.assertIn("app_protocols", csv_data)
+    
+    def test_host_connection_count_accurate(self):
+        stats = StatisticsCollector()
+        
+        for i in range(5):
+            ctx = self._make_ctx(
+                src_ip="192.168.1.100",
+                dst_ip="10.0.0.50",
+                src_port=10000 + i,
+                dst_port=80,
+            )
+            stats.record_packet(ctx)
+        
+        hosts = {h.ip: h for h in stats.get_top_hosts(n=10)}
+        self.assertEqual(hosts["192.168.1.100"].connections, 5)
+        self.assertEqual(hosts["10.0.0.50"].connections, 5)
+        
+        conns = stats.get_connection_stats()
+        self.assertEqual(len(conns), 5)
+    
+    def test_sessions_export_json(self):
+        stats = StatisticsCollector()
+        ctx = self._make_ctx()
+        stats.record_packet(ctx)
+        
+        json_str = stats.export_sessions_json()
+        self.assertIsInstance(json_str, str)
+        import json
+        sessions = json.loads(json_str)
+        self.assertGreater(len(sessions), 0)
+        self.assertIn("src_ip", sessions[0])
+        self.assertIn("dst_ip", sessions[0])
+        self.assertIn("protocol", sessions[0])
+        self.assertIn("duration", sessions[0])
+        self.assertIn("app_protocol", sessions[0])
+        self.assertIn("state", sessions[0])
+    
+    def test_sessions_filter_by_protocol(self):
+        stats = StatisticsCollector()
+        
+        tcp_ctx = self._make_ctx()
+        stats.record_packet(tcp_ctx)
+        
+        udp_ctx = self._make_ctx(is_tcp=False, src_port=53, dst_port=53)
+        stats.record_packet(udp_ctx)
+        
+        tcp_sessions = stats.get_sessions(protocol="tcp")
+        self.assertEqual(len(tcp_sessions), 1)
+        
+        udp_sessions = stats.get_sessions(protocol="udp")
+        self.assertEqual(len(udp_sessions), 1)
+    
+    def test_sessions_filter_by_port(self):
+        stats = StatisticsCollector()
+        
+        ctx1 = self._make_ctx(src_port=12345, dst_port=80)
+        stats.record_packet(ctx1)
+        
+        ctx2 = self._make_ctx(src_port=54321, dst_port=443)
+        stats.record_packet(ctx2)
+        
+        sessions_80 = stats.get_sessions(port=80)
+        self.assertEqual(len(sessions_80), 1)
+        
+        sessions_443 = stats.get_sessions(port=443)
+        self.assertEqual(len(sessions_443), 1)
+    
+    def test_sessions_filter_by_port_range(self):
+        stats = StatisticsCollector()
+        
+        ctx1 = self._make_ctx(src_port=12345, dst_port=80)
+        stats.record_packet(ctx1)
+        
+        ctx2 = self._make_ctx(src_port=54321, dst_port=8080)
+        stats.record_packet(ctx2)
+        
+        sessions = stats.get_sessions(port_range=(1, 1000))
+        self.assertEqual(len(sessions), 1)
+    
+    def test_sessions_export_csv(self):
+        stats = StatisticsCollector()
+        ctx = self._make_ctx()
+        stats.record_packet(ctx)
+        
+        csv_str = stats.export_sessions_csv()
+        self.assertIsInstance(csv_str, str)
+        self.assertIn("src_ip", csv_str)
+        self.assertIn("dst_ip", csv_str)
+        self.assertIn("protocol", csv_str)
+        self.assertIn("duration", csv_str)
+    
+    def test_time_window_custom_size(self):
+        stats = StatisticsCollector(time_window_seconds=5)
+        
+        for i in range(3):
+            ctx = self._make_ctx()
+            stats.record_packet(ctx, timestamp=i * 10.0)
+        
+        ts = stats.get_time_series()
+        self.assertEqual(ts["window_seconds"], 5)
+        self.assertEqual(len(ts["timestamps"]), 3)
+    
+    def test_time_window_protocol_distribution(self):
+        stats = StatisticsCollector(time_window_seconds=1)
+        
+        for i in range(3):
+            ctx = self._make_ctx()
+            stats.record_packet(ctx, timestamp=i * 0.1)
+        
+        for i in range(2):
+            ctx = self._make_ctx(is_tcp=False, src_port=53, dst_port=53)
+            stats.record_packet(ctx, timestamp=1.0 + i * 0.1)
+        
+        ts = stats.get_time_series()
+        self.assertIn("tcp_packets", ts)
+        self.assertIn("udp_packets", ts)
+        self.assertIn("app_protocol_packets", ts)
+        self.assertGreater(sum(ts["tcp_packets"]), 0)
+    
+    def test_set_time_window(self):
+        stats = StatisticsCollector(time_window_seconds=1)
+        ctx = self._make_ctx()
+        stats.record_packet(ctx, timestamp=0.0)
+        
+        stats.set_time_window(60)
+        ts = stats.get_time_series()
+        self.assertEqual(ts["window_seconds"], 60)
+        self.assertEqual(len(ts["timestamps"]), 0)
 
 
 class TestNetworkAnalyzer(unittest.TestCase):

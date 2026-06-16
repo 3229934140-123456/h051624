@@ -85,8 +85,12 @@ class FilterTokenType(Enum):
     KW_AND = "and"
     KW_OR = "or"
     KW_NOT = "not"
+    KW_LESS = "less"
+    KW_GREATER = "greater"
+    KW_PORTRANGE = "portrange"
     LPAREN = "("
     RPAREN = ")"
+    HYPHEN = "-"
 
 
 @dataclass
@@ -240,6 +244,46 @@ class SimpleFilter(FilterExpression):
                 ports.extend([ctx.udp.src_port, ctx.udp.dst_port])
             return ports if ports else None
         
+        if field == "port.portrange":
+            ports = []
+            if ctx.tcp:
+                ports.extend([ctx.tcp.src_port, ctx.tcp.dst_port])
+            if ctx.udp:
+                ports.extend([ctx.udp.src_port, ctx.udp.dst_port])
+            return ports if ports else None
+        
+        if field == "tcp.portrange":
+            if not ctx.tcp:
+                return None
+            return [ctx.tcp.src_port, ctx.tcp.dst_port]
+        
+        if field == "udp.portrange":
+            if not ctx.udp:
+                return None
+            return [ctx.udp.src_port, ctx.udp.dst_port]
+        
+        if field == "tcp.srcportrange":
+            return ctx.tcp.src_port if ctx.tcp else None
+        if field == "tcp.dstportrange":
+            return ctx.tcp.dst_port if ctx.tcp else None
+        if field == "udp.srcportrange":
+            return ctx.udp.src_port if ctx.udp else None
+        if field == "udp.dstportrange":
+            return ctx.udp.dst_port if ctx.udp else None
+        
+        if field == "srcportrange":
+            if ctx.tcp:
+                return ctx.tcp.src_port
+            if ctx.udp:
+                return ctx.udp.src_port
+            return None
+        if field == "dstportrange":
+            if ctx.tcp:
+                return ctx.tcp.dst_port
+            if ctx.udp:
+                return ctx.udp.dst_port
+            return None
+        
         if field == "tcp.port":
             if not ctx.tcp:
                 return None
@@ -279,6 +323,23 @@ class SimpleFilter(FilterExpression):
     
     def _compare(self, actual: Any, expected: Any) -> bool:
         is_cidr = isinstance(expected, str) and "/" in expected and expected.count(".") == 3
+        is_range = isinstance(expected, tuple) and len(expected) == 2
+        
+        if is_range and self.operator == FilterOperator.EQ:
+            min_val, max_val = expected
+            if isinstance(actual, list):
+                try:
+                    return any(
+                        min_val <= float(a) <= max_val
+                        for a in actual if not isinstance(a, bool)
+                    )
+                except (ValueError, TypeError):
+                    return False
+            try:
+                actual_val = float(actual) if not isinstance(actual, bool) else int(actual)
+                return min_val <= actual_val <= max_val
+            except (ValueError, TypeError):
+                return False
         
         if isinstance(actual, list):
             if is_cidr:
@@ -584,9 +645,20 @@ class FilterParser:
                     self.tokens.append(FilterToken(type=FilterTokenType.KW_OR, position=i))
                 elif ident.lower() == "not":
                     self.tokens.append(FilterToken(type=FilterTokenType.KW_NOT, position=i))
+                elif ident.lower() == "less":
+                    self.tokens.append(FilterToken(type=FilterTokenType.KW_LESS, position=i))
+                elif ident.lower() == "greater":
+                    self.tokens.append(FilterToken(type=FilterTokenType.KW_GREATER, position=i))
+                elif ident.lower() == "portrange":
+                    self.tokens.append(FilterToken(type=FilterTokenType.KW_PORTRANGE, position=i))
                 else:
                     self.tokens.append(FilterToken(type=FilterTokenType.IDENTIFIER, value=ident, position=i))
                 i = j
+                continue
+            
+            if s[i] == "-":
+                self.tokens.append(FilterToken(type=FilterTokenType.HYPHEN, position=i))
+                i += 1
                 continue
             
             i += 1
@@ -646,8 +718,8 @@ class FilterParser:
             self.pos += 1
             return expr
         
-        if token.type == FilterTokenType.IDENTIFIER:
-            field_name = token.value.lower()
+        if token.type == FilterTokenType.IDENTIFIER or token.type == FilterTokenType.KW_PORTRANGE:
+            field_name = token.value.lower() if token.type == FilterTokenType.IDENTIFIER else "portrange"
             self.pos += 1
             
             field_name = self._combine_field_name(field_name)
@@ -661,6 +733,7 @@ class FilterParser:
                 FilterTokenType.OP_EQ, FilterTokenType.OP_NEQ,
                 FilterTokenType.OP_LT, FilterTokenType.OP_GT,
                 FilterTokenType.OP_LE, FilterTokenType.OP_GE,
+                FilterTokenType.KW_LESS, FilterTokenType.KW_GREATER,
             ):
                 op_token = self.tokens[self.pos]
                 self.pos += 1
@@ -678,6 +751,8 @@ class FilterParser:
                     FilterTokenType.OP_GT: FilterOperator.GT,
                     FilterTokenType.OP_LE: FilterOperator.LE,
                     FilterTokenType.OP_GE: FilterOperator.GE,
+                    FilterTokenType.KW_LESS: FilterOperator.LT,
+                    FilterTokenType.KW_GREATER: FilterOperator.GT,
                 }
                 
                 return SimpleFilter(
@@ -686,8 +761,36 @@ class FilterParser:
                     value=val_token.value
                 )
             
+            if self.pos < len(self.tokens) and self.tokens[self.pos].type == FilterTokenType.NUMBER:
+                val_token = self.tokens[self.pos]
+                self.pos += 1
+                value = val_token.value
+                
+                if full_field.endswith(".portrange") or full_field.endswith("portrange"):
+                    if self.pos < len(self.tokens) and self.tokens[self.pos].type == FilterTokenType.HYPHEN:
+                        self.pos += 1
+                        if self.pos >= len(self.tokens) or self.tokens[self.pos].type != FilterTokenType.NUMBER:
+                            raise ValueError("Expected end port after '-' in portrange")
+                        end_port = self.tokens[self.pos].value
+                        self.pos += 1
+                        value = (value, end_port)
+                
+                if full_field.startswith("tcp.flags."):
+                    flag_name = full_field.split(".")[-1].lower()
+                    if isinstance(value, str) and value.lower() in ("1", "true", "set"):
+                        value = True
+                    elif isinstance(value, str) and value.lower() in ("0", "false", "not"):
+                        value = False
+                    else:
+                        value = True
+                
+                return SimpleFilter(
+                    field=full_field,
+                    operator=FilterOperator.EQ,
+                    value=value
+                )
+            
             if self.pos < len(self.tokens) and self.tokens[self.pos].type in (
-                FilterTokenType.NUMBER,
                 FilterTokenType.IP,
                 FilterTokenType.NETWORK,
                 FilterTokenType.MAC,
@@ -730,11 +833,17 @@ class FilterParser:
             "srcport", "dstport", "sport", "dport",
             "proto", "protocol", "ttl", "id", "len", "length",
             "syn", "ack", "fin", "rst", "psh", "urg",
-            "type", "net",
+            "type", "net", "portrange",
         }
         
         while self.pos < len(self.tokens):
             next_token = self.tokens[self.pos]
+            
+            if next_token.type == FilterTokenType.KW_PORTRANGE:
+                parts.append("portrange")
+                self.pos += 1
+                break
+            
             if next_token.type != FilterTokenType.IDENTIFIER:
                 break
             
@@ -790,11 +899,18 @@ class FilterParser:
                     return f"{first}.srcport"
                 if parts[1] in {"dport", "dstport"}:
                     return f"{first}.dstport"
+            if len(parts) == 2 and parts[1] == "portrange":
+                return f"{first}.portrange"
             if len(parts) == 3 and parts[1] in {"src", "dst"} and parts[2] == "port":
                 if parts[1] == "src":
                     return f"{first}.srcport"
                 if parts[1] == "dst":
                     return f"{first}.dstport"
+            if len(parts) == 3 and parts[1] in {"src", "dst"} and parts[2] == "portrange":
+                if parts[1] == "src":
+                    return f"{first}.srcportrange"
+                if parts[1] == "dst":
+                    return f"{first}.dstportrange"
             if len(parts) == 2 and parts[1] == "src":
                 return f"{first}.srcport"
             if len(parts) == 2 and parts[1] == "dst":
@@ -812,6 +928,8 @@ class FilterParser:
         if first == "src":
             if len(parts) == 2 and parts[1] == "port":
                 return "srcport"
+            if len(parts) == 2 and parts[1] == "portrange":
+                return "srcportrange"
             if len(parts) == 2 and parts[1] == "host":
                 return "srcip"
             if len(parts) == 2 and parts[1] == "net":
@@ -821,6 +939,8 @@ class FilterParser:
         if first == "dst":
             if len(parts) == 2 and parts[1] == "port":
                 return "dstport"
+            if len(parts) == 2 and parts[1] == "portrange":
+                return "dstportrange"
             if len(parts) == 2 and parts[1] == "host":
                 return "dstip"
             if len(parts) == 2 and parts[1] == "net":
@@ -835,6 +955,9 @@ class FilterParser:
         
         if first == "port":
             return "port"
+        
+        if first == "portrange":
+            return "port.portrange"
         
         return ".".join(parts)
     
@@ -864,10 +987,13 @@ class FilterParser:
             "host": "ip.host",
             "net": "ip.host",
             "port": "port",
+            "portrange": "port.portrange",
             "srcport": "srcport",
             "dstport": "dstport",
             "sport": "srcport",
             "dport": "dstport",
+            "srcportrange": "srcportrange",
+            "dstportrange": "dstportrange",
             
             "ether.src": "ether.src",
             "ether.dst": "ether.dst",

@@ -185,12 +185,25 @@ class TimeWindowStats:
     packet_counts: List[int] = field(default_factory=list)
     byte_counts: List[int] = field(default_factory=list)
     timestamps: List[float] = field(default_factory=list)
+    tcp_packets: List[int] = field(default_factory=list)
+    tcp_bytes: List[int] = field(default_factory=list)
+    udp_packets: List[int] = field(default_factory=list)
+    udp_bytes: List[int] = field(default_factory=list)
+    app_protocol_packets: List[Dict[str, int]] = field(default_factory=list)
+    app_protocol_bytes: List[Dict[str, int]] = field(default_factory=list)
     max_windows: int = 1000
     
-    def add_packet(self, size: int, timestamp: float):
+    def add_packet(
+        self,
+        size: int,
+        timestamp: float,
+        is_tcp: bool = False,
+        is_udp: bool = False,
+        app_protocol: Optional[str] = None,
+    ):
         """添加一个包到当前时间窗口"""
         if not self.timestamps:
-            self._add_new_window(size, timestamp)
+            self._add_new_window(size, timestamp, is_tcp, is_udp, app_protocol)
             return
         
         window_start = int(timestamp / self.window_seconds) * self.window_seconds
@@ -199,24 +212,64 @@ class TimeWindowStats:
         if window_start == last_window_start:
             self.packet_counts[-1] += 1
             self.byte_counts[-1] += size
+            if is_tcp:
+                self.tcp_packets[-1] += 1
+                self.tcp_bytes[-1] += size
+            if is_udp:
+                self.udp_packets[-1] += 1
+                self.udp_bytes[-1] += size
+            if app_protocol and app_protocol != "unknown":
+                self.app_protocol_packets[-1][app_protocol] = self.app_protocol_packets[-1].get(app_protocol, 0) + 1
+                self.app_protocol_bytes[-1][app_protocol] = self.app_protocol_bytes[-1].get(app_protocol, 0) + size
         else:
-            self._add_new_window(size, timestamp)
+            self._add_new_window(size, timestamp, is_tcp, is_udp, app_protocol)
     
-    def _add_new_window(self, size: int, timestamp: float):
+    def _add_new_window(
+        self,
+        size: int,
+        timestamp: float,
+        is_tcp: bool = False,
+        is_udp: bool = False,
+        app_protocol: Optional[str] = None,
+    ):
         window_start = int(timestamp / self.window_seconds) * self.window_seconds
         self.packet_counts.append(1)
         self.byte_counts.append(size)
         self.timestamps.append(window_start)
+        self.tcp_packets.append(1 if is_tcp else 0)
+        self.tcp_bytes.append(size if is_tcp else 0)
+        self.udp_packets.append(1 if is_udp else 0)
+        self.udp_bytes.append(size if is_udp else 0)
+        
+        app_pkts = {}
+        app_bytes = {}
+        if app_protocol and app_protocol != "unknown":
+            app_pkts[app_protocol] = 1
+            app_bytes[app_protocol] = size
+        self.app_protocol_packets.append(app_pkts)
+        self.app_protocol_bytes.append(app_bytes)
         
         if len(self.packet_counts) > self.max_windows:
             self.packet_counts.pop(0)
             self.byte_counts.pop(0)
             self.timestamps.pop(0)
+            self.tcp_packets.pop(0)
+            self.tcp_bytes.pop(0)
+            self.udp_packets.pop(0)
+            self.udp_bytes.pop(0)
+            self.app_protocol_packets.pop(0)
+            self.app_protocol_bytes.pop(0)
     
     def reset(self):
         self.packet_counts.clear()
         self.byte_counts.clear()
         self.timestamps.clear()
+        self.tcp_packets.clear()
+        self.tcp_bytes.clear()
+        self.udp_packets.clear()
+        self.udp_bytes.clear()
+        self.app_protocol_packets.clear()
+        self.app_protocol_bytes.clear()
 
 
 class StatisticsCollector:
@@ -235,7 +288,7 @@ class StatisticsCollector:
         top_connections = stats.get_top_connections(10)
     """
     
-    def __init__(self):
+    def __init__(self, time_window_seconds: int = 1):
         self._lock = threading.Lock()
         self._global = GlobalStats()
         
@@ -250,7 +303,7 @@ class StatisticsCollector:
         self._tcp_port_stats: Dict[int, ProtocolStats] = defaultdict(ProtocolStats)
         self._udp_port_stats: Dict[int, ProtocolStats] = defaultdict(ProtocolStats)
         
-        self._time_window = TimeWindowStats(window_seconds=1)
+        self._time_window = TimeWindowStats(window_seconds=time_window_seconds)
     
     def record_packet(self, ctx: Any, timestamp: Optional[float] = None):
         """
@@ -418,7 +471,10 @@ class StatisticsCollector:
             size = len(ctx.ethernet.raw_frame)
         
         if size > 0:
-            self._time_window.add_packet(size, timestamp)
+            is_tcp = ctx.tcp is not None
+            is_udp = ctx.udp is not None
+            app_proto = ctx.app_protocol if hasattr(ctx, "app_protocol") else None
+            self._time_window.add_packet(size, timestamp, is_tcp=is_tcp, is_udp=is_udp, app_protocol=app_proto)
     
     def _make_five_tuple(
         self,
@@ -494,6 +550,196 @@ class StatisticsCollector:
             
             return connections[:n]
     
+    def get_sessions(
+        self,
+        protocol: Optional[str] = None,
+        port: Optional[int] = None,
+        port_range: Optional[Tuple[int, int]] = None,
+        app_protocol: Optional[str] = None,
+        sort_by: str = "byte_count",
+        limit: Optional[int] = None,
+    ) -> List[ConnectionStats]:
+        """
+        获取会话列表，支持按条件筛选
+        
+        Args:
+            protocol: 传输层协议筛选 ("tcp" 或 "udp")
+            port: 端口筛选（源或目的端口匹配）
+            port_range: 端口范围筛选 (min_port, max_port)
+            app_protocol: 应用层协议筛选
+            sort_by: 排序字段 (byte_count, packet_count, duration, start_time)
+            limit: 返回数量限制
+        
+        Returns:
+            List[ConnectionStats]: 筛选后的会话列表
+        """
+        from network_analyzer.utils.packet_utils import IP_PROTO_TCP, IP_PROTO_UDP
+        
+        with self._lock:
+            connections = list(self._connection_stats.values())
+            
+            if protocol:
+                proto_lower = protocol.lower()
+                if proto_lower == "tcp":
+                    connections = [c for c in connections if c.five_tuple[4] == IP_PROTO_TCP]
+                elif proto_lower == "udp":
+                    connections = [c for c in connections if c.five_tuple[4] == IP_PROTO_UDP]
+            
+            if port is not None:
+                connections = [
+                    c for c in connections
+                    if c.five_tuple[1] == port or c.five_tuple[3] == port
+                ]
+            
+            if port_range:
+                min_p, max_p = port_range
+                connections = [
+                    c for c in connections
+                    if min_p <= c.five_tuple[1] <= max_p
+                    or min_p <= c.five_tuple[3] <= max_p
+                ]
+            
+            if app_protocol:
+                connections = [
+                    c for c in connections
+                    if c.app_protocol and c.app_protocol.lower() == app_protocol.lower()
+                ]
+            
+            if sort_by == "byte_count":
+                connections.sort(key=lambda c: c.byte_count, reverse=True)
+            elif sort_by == "packet_count":
+                connections.sort(key=lambda c: c.packet_count, reverse=True)
+            elif sort_by == "duration":
+                connections.sort(key=lambda c: c.duration, reverse=True)
+            elif sort_by == "start_time":
+                connections.sort(key=lambda c: c.start_time)
+            
+            if limit:
+                connections = connections[:limit]
+            
+            return connections
+    
+    def export_sessions_json(
+        self,
+        protocol: Optional[str] = None,
+        port: Optional[int] = None,
+        port_range: Optional[Tuple[int, int]] = None,
+        app_protocol: Optional[str] = None,
+        sort_by: str = "byte_count",
+        limit: Optional[int] = None,
+        pretty: bool = True,
+    ) -> str:
+        """
+        导出会话明细为JSON格式
+        
+        Args:
+            protocol: 传输层协议筛选 ("tcp" 或 "udp")
+            port: 端口筛选
+            port_range: 端口范围筛选 (min_port, max_port)
+            app_protocol: 应用层协议筛选
+            sort_by: 排序字段
+            limit: 返回数量限制
+            pretty: 是否格式化输出
+        
+        Returns:
+            str: JSON格式的会话列表
+        """
+        sessions = self.get_sessions(
+            protocol=protocol,
+            port=port,
+            port_range=port_range,
+            app_protocol=app_protocol,
+            sort_by=sort_by,
+            limit=limit,
+        )
+        
+        from network_analyzer.utils.packet_utils import IP_PROTO_TCP
+        
+        result = []
+        for conn in sessions:
+            result.append({
+                "src_ip": conn.five_tuple[0],
+                "src_port": conn.five_tuple[1],
+                "dst_ip": conn.five_tuple[2],
+                "dst_port": conn.five_tuple[3],
+                "protocol": "TCP" if conn.five_tuple[4] == IP_PROTO_TCP else "UDP",
+                "start_time": conn.start_time,
+                "end_time": conn.last_time,
+                "duration": round(conn.duration, 6),
+                "packet_count": conn.packet_count,
+                "byte_count": conn.byte_count,
+                "client_packets": conn.client_packets,
+                "server_packets": conn.server_packets,
+                "client_bytes": conn.client_bytes,
+                "server_bytes": conn.server_bytes,
+                "app_protocol": conn.app_protocol,
+                "state": conn.state,
+            })
+        
+        indent = 2 if pretty else None
+        return json.dumps(result, indent=indent, default=str)
+    
+    def export_sessions_csv(
+        self,
+        protocol: Optional[str] = None,
+        port: Optional[int] = None,
+        port_range: Optional[Tuple[int, int]] = None,
+        app_protocol: Optional[str] = None,
+        sort_by: str = "byte_count",
+        limit: Optional[int] = None,
+    ) -> str:
+        """
+        导出会话明细为CSV格式
+        
+        Args:
+            protocol: 传输层协议筛选
+            port: 端口筛选
+            port_range: 端口范围筛选
+            app_protocol: 应用层协议筛选
+            sort_by: 排序字段
+            limit: 返回数量限制
+        
+        Returns:
+            str: CSV格式的会话列表
+        """
+        sessions = self.get_sessions(
+            protocol=protocol,
+            port=port,
+            port_range=port_range,
+            app_protocol=app_protocol,
+            sort_by=sort_by,
+            limit=limit,
+        )
+        
+        from network_analyzer.utils.packet_utils import IP_PROTO_TCP
+        
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "src_ip", "src_port", "dst_ip", "dst_port", "protocol",
+            "start_time", "end_time", "duration",
+            "packet_count", "byte_count",
+            "client_packets", "server_packets",
+            "client_bytes", "server_bytes",
+            "app_protocol", "state"
+        ])
+        
+        for conn in sessions:
+            proto = "TCP" if conn.five_tuple[4] == IP_PROTO_TCP else "UDP"
+            writer.writerow([
+                conn.five_tuple[0], conn.five_tuple[1],
+                conn.five_tuple[2], conn.five_tuple[3],
+                proto,
+                conn.start_time, conn.last_time,
+                round(conn.duration, 6),
+                conn.packet_count, conn.byte_count,
+                conn.client_packets, conn.server_packets,
+                conn.client_bytes, conn.server_bytes,
+                conn.app_protocol, conn.state
+            ])
+        
+        return output.getvalue()
+    
     def get_top_hosts(self, n: int = 10, sort_by: str = "total_bytes") -> List[HostStats]:
         """
         获取Top N主机
@@ -539,19 +785,39 @@ class StatisticsCollector:
             ports.sort(key=lambda x: x[1].byte_count, reverse=True)
             return ports[:n]
     
-    def get_time_series(self) -> Tuple[List[float], List[int], List[int]]:
+    def get_time_series(self) -> Dict[str, Any]:
         """
         获取时间序列数据
         
         Returns:
-            Tuple[时间戳列表, 包数列表, 字节数列表]
+            包含时间戳、包数、字节数，以及TCP/UDP/应用协议分布的字典
+        """
+        from network_analyzer.utils.packet_utils import IP_PROTO_NAME
+        
+        with self._lock:
+            tw = self._time_window
+            return {
+                "window_seconds": tw.window_seconds,
+                "timestamps": list(tw.timestamps),
+                "packet_counts": list(tw.packet_counts),
+                "byte_counts": list(tw.byte_counts),
+                "tcp_packets": list(tw.tcp_packets),
+                "tcp_bytes": list(tw.tcp_bytes),
+                "udp_packets": list(tw.udp_packets),
+                "udp_bytes": list(tw.udp_bytes),
+                "app_protocol_packets": [dict(d) for d in tw.app_protocol_packets],
+                "app_protocol_bytes": [dict(d) for d in tw.app_protocol_bytes],
+            }
+    
+    def set_time_window(self, window_seconds: int):
+        """
+        设置时间窗口大小（会重置现有窗口数据）
+        
+        Args:
+            window_seconds: 窗口大小（秒）
         """
         with self._lock:
-            return (
-                list(self._time_window.timestamps),
-                list(self._time_window.packet_counts),
-                list(self._time_window.byte_counts),
-            )
+            self._time_window = TimeWindowStats(window_seconds=window_seconds)
     
     def get_summary(self) -> Dict[str, Any]:
         """获取统计摘要"""
@@ -697,9 +963,15 @@ class StatisticsCollector:
             
             data["time_series"] = {
                 "window_seconds": self._time_window.window_seconds,
-                "timestamps": self._time_window.timestamps,
-                "packet_counts": self._time_window.packet_counts,
-                "byte_counts": self._time_window.byte_counts,
+                "timestamps": list(self._time_window.timestamps),
+                "packet_counts": list(self._time_window.packet_counts),
+                "byte_counts": list(self._time_window.byte_counts),
+                "tcp_packets": list(self._time_window.tcp_packets),
+                "tcp_bytes": list(self._time_window.tcp_bytes),
+                "udp_packets": list(self._time_window.udp_packets),
+                "udp_bytes": list(self._time_window.udp_bytes),
+                "app_protocol_packets": [dict(d) for d in self._time_window.app_protocol_packets],
+                "app_protocol_bytes": [dict(d) for d in self._time_window.app_protocol_bytes],
             }
             
             indent = 2 if pretty else None
@@ -804,15 +1076,38 @@ class StatisticsCollector:
                 result["udp_ports"] = output.getvalue()
             
             if "time_series" in sections:
+                tw = self._time_window
+                all_app_protos = set()
+                for d in tw.app_protocol_packets:
+                    all_app_protos.update(d.keys())
+                app_proto_list = sorted(all_app_protos)
+                
                 output = io.StringIO()
                 writer = csv.writer(output)
-                writer.writerow(["timestamp", "packet_count", "byte_count"])
-                for i in range(len(self._time_window.timestamps)):
-                    writer.writerow([
-                        self._time_window.timestamps[i],
-                        self._time_window.packet_counts[i],
-                        self._time_window.byte_counts[i]
-                    ])
+                header = [
+                    "timestamp", "packet_count", "byte_count",
+                    "tcp_packets", "tcp_bytes",
+                    "udp_packets", "udp_bytes"
+                ]
+                for ap in app_proto_list:
+                    header.append(f"{ap}_packets")
+                    header.append(f"{ap}_bytes")
+                writer.writerow(header)
+                
+                for i in range(len(tw.timestamps)):
+                    row = [
+                        tw.timestamps[i],
+                        tw.packet_counts[i],
+                        tw.byte_counts[i],
+                        tw.tcp_packets[i],
+                        tw.tcp_bytes[i],
+                        tw.udp_packets[i],
+                        tw.udp_bytes[i],
+                    ]
+                    for ap in app_proto_list:
+                        row.append(tw.app_protocol_packets[i].get(ap, 0))
+                        row.append(tw.app_protocol_bytes[i].get(ap, 0))
+                    writer.writerow(row)
                 result["time_series"] = output.getvalue()
             
             return result
