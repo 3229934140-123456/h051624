@@ -349,7 +349,8 @@ class StatisticsCollector:
         
         five_tuple = self._make_five_tuple(src_ip, src_port, dst_ip, dst_port, proto)
         
-        if five_tuple not in self._connection_stats:
+        is_new_connection = five_tuple not in self._connection_stats
+        if is_new_connection:
             self._connection_stats[five_tuple] = ConnectionStats(
                 five_tuple=five_tuple,
                 start_time=timestamp
@@ -373,6 +374,10 @@ class StatisticsCollector:
         
         if ctx.app_protocol:
             conn.app_protocol = ctx.app_protocol
+        
+        if is_new_connection:
+            self._host_stats[src_ip].connections += 1
+            self._host_stats[dst_ip].connections += 1
     
     def _record_hosts(self, ctx: Any):
         """记录主机统计"""
